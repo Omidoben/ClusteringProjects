@@ -1,0 +1,426 @@
+---
+title: "Wine Data Clustering and PCA Analysis"
+author: "Benard Omido"
+date: "2024-08-11"
+output: html_document
+---
+
+# **Project Overview**
+
+**This project involves the analysis and clustering of a wine dataset adopted from Kaggle, containing 13 variables including alcohol, malic acid, and other chemical properties of wines. The dataset does not include any outcome variable, making it ideal for unsupervised learning techniques. The primary goal of this project is to explore the underlying patterns within the data by applying clustering algorithms such as k-means and hierarchical clustering. Additionally, Principal Component Analysis (PCA) will be performed to reduce the dimensionality of the data and to compare the performance and insights derived from these clustering methods.**
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+```{r}
+# Load the libraries
+library(tidyverse)
+library(tidymodels)
+library(tidyclust)
+```
+
+```{r}
+# Load the data
+wine <- read_csv("wine-clustering.csv")
+glimpse(wine)
+```
+**EDA**
+```{r, results='hide'}
+library(skimr)
+skim(wine)
+# There are no missing values in the data set
+```
+**Distribution of different variables**
+```{r}
+wine %>% 
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>% 
+  ggplot(aes(Value, fill = Variable)) +
+  geom_histogram() +
+  facet_wrap(~Variable, scales = "free_x")
+# Majority of the variables are right skewed
+```
+
+**Correlation analysis** 
+```{r}
+library(ggcorrplot)
+
+cor_matrix <- cor(wine, use = "complete.obs")
+
+ggcorrplot(cor_matrix, method = "square", 
+           type = "full", lab = TRUE, lab_size = 3, tl.cex = 10)
+```
+
+There are a few highly correlated variables, for example; alcohol and proline , Flavanoids and OD280
+
+### **Data Preprocessing**
+
+Train and test sets
+```{r}
+set.seed(123)
+wine_splits <- initial_split(wine, prop = 0.75)
+wine_train <- training(wine_splits)
+wine_test <- testing(wine_splits)
+
+```
+
+**Recipes**
+```{r}
+basic_rec <- recipe(~., data = wine_train) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+
+prep(basic_rec)
+
+# Add a principal component analysis step because of the highly correlated variables
+pca_rec <- basic_rec %>% 
+  step_pca(all_numeric_predictors(), num_comp = 4)
+```
+
+### **Kmeans Clustering**
+**Model Specification**
+
+- Using a kmeans clustering algorithm - It classifies the observations into a set of k groups such that observations within the same cluster are as similar as possible where as observations from different clusters are as dissimilar as possible
+
+```{r}
+kmeans_spec <- k_means(num_clusters = tune()) %>% 
+  set_engine("stats")
+```
+**Workflow**
+
+```{r}
+kmeans_wf <-workflow() %>% 
+  add_recipe(basic_rec) %>% 
+  add_model(kmeans_spec)
+```
+
+**Tuning**
+
+```{r}
+# First create cross validation folds
+set.seed(4567)
+wine_folds <- vfold_cv(wine_train, v = 10)
+
+# Create a grid
+grid <- tibble(num_clusters = 1:10)
+
+wine_res <- tune_cluster(
+  kmeans_wf,
+  resamples = wine_folds,
+  grid = grid,
+  metrics = cluster_metric_set(silhouette_avg)
+)
+
+wine_res
+
+wine_res %>% 
+  collect_metrics()
+
+```
+
+```{r}
+# Visualizing the results
+wine_res %>% 
+  collect_metrics() %>% 
+  select(num_clusters, mean) %>% 
+  ggplot(aes(x = num_clusters, y = mean)) +
+  geom_point() +
+  geom_line() +
+  theme_minimal() +
+  ylab("mean silhoutte score") +
+  xlab("Number of clusters") +
+  scale_x_continuous(breaks = 1:10) 
+```
+
+Based on the tuning results, the highest silhouette average obtained is 0.28, which corresponds to 3 clusters, indicating that 3 is the optimal number of clusters for the model.
+
+```{r}
+# Select the best cluster and finalize the workflow
+
+best_cluster <- tibble(num_clusters = 3)
+
+wines_final_wf <- finalize_workflow_tidyclust(kmeans_wf, best_cluster)
+wines_final_wf
+
+# Fit the model
+wines_fit <- fit(wines_final_wf, data = wine_train)
+wines_fit
+```
+
+```{r}
+extract_cluster_assignment(wines_fit) %>% table()   # returns the cluster assignments of                                                   the training observations
+```
+Most observations are in the second cluster
+
+```{r}
+extract_centroids(wines_fit)   #returns the location of the centroids
+```
+
+**Visualize the clusters**
+
+```{r}
+library(factoextra)
+
+# fviz_cluster() doesn't accept a workflow object, thus the need to extract the fitted      k-means model from the workflow object before passing it to fviz_cluster()
+
+# extract_fit_parsnip - Extracts the fitted k-means model from the workflow object.
+kmeans_model <- extract_fit_parsnip(wines_fit)$fit
+
+fviz_cluster(kmeans_model, data = prep(basic_rec) %>% bake(new_data = NULL),
+             geom = "point",
+             ellipse.type = "convex",
+             palette = "jco",
+             ggtheme = theme_minimal())
+```
+
+**An interactive visualization of clusters in the wine dataset using the variables Alcohol and Malic_Acid.**
+
+```{r}
+p <- wine_train %>% 
+  bind_cols(extract_cluster_assignment(wines_fit), .) %>% 
+  ggplot(aes(Alcohol, Malic_Acid)) +
+  geom_point(aes(fill = .cluster),
+             shape = 21,
+             alpha = 0.5,
+             size = 5) +
+  geom_smooth(color = "blue", se = FALSE) +
+  scale_y_log10() +
+  scale_x_log10()
+
+library(plotly)
+ggplotly(p)
+```
+
+To make predictions using the fitted model, use predict()
+
+```{r}
+# Making some predictions
+predict(wines_fit, new_data = slice_sample(wine_train, n = 10))   # returns the cluster a new                                                                 observation belongs to
+```
+
+```{r}
+# Fit the model on the test data to assess performance on new data
+wines_pred <- predict(wines_fit, new_data = wine_test)
+wines_pred
+```
+
+
+- After fitting the k-means model, the silhouette average score achieved was 0.28, indicating moderate cluster separation.
+- A silhouette score of 0.285 suggests that the clustering is not very strong, and there may be some degree of overlap or ambiguity in the cluster assignments.
+- Can be improved by reviewing the number of clusters, employing PCA, or using alternative clustering algorithms
+- Step 1: Fit a Hierarchical model to explore whether it improves clustering performance
+
+
+### **Hierarchical Clustering (Agglomerative Clustering)**
+- It is an algorithm that creates a hierarchy of clusters, does not require the pre-specification of the number of clusters
+- Agglomerative clustering is a type of hierarchical clustering that works in a bottom up manner
+- It starts with each data point as its own cluster and gradually merges them based on some measure of similarity or distance, such as Euclidean distance
+
+**Model specification**
+
+```{r}
+hc_spec <- hier_clust(num_clusters = tune(),
+                      linkage_method = "ward.D2") %>% 
+  set_engine("stats")
+
+hc_spec
+```
+
+**Workflow**
+
+```{r}
+hc_wf <- workflow() %>% 
+  add_recipe(basic_rec) %>% 
+  add_model(hc_spec)
+
+hc_wf
+```
+
+**Model tuning**
+
+```{r}
+set.seed(4566)
+hc_res <- tune_cluster(
+  hc_wf,
+  resamples = wine_folds,
+  grid = grid,
+  metrics = cluster_metric_set(silhouette_avg)
+)
+  
+hc_res
+
+hc_res %>% 
+  collect_metrics()
+```
+
+```{r}
+# Visualizing the result
+hc_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(num_clusters, mean)) +
+  geom_point() +
+  geom_line() +
+  theme_minimal() +
+  ylab("mean silhoutte score") +
+  xlab("Number of clusters") +
+  scale_x_continuous(breaks = 1:10) 
+```
+
+After fitting the hierarchical model, the silhouette average score obtained was 0.27, corresponding to 3 clusters. This is consistent with the k-means model, which also identified 3 clusters as optimal.
+
+```{r}
+# Finalize the workflow and fit the model
+best_cluster <- tibble(num_clusters = 3)
+
+hc_final <- finalize_workflow_tidyclust(hc_wf, best_cluster)
+
+hc_fit <- fit(hc_final, data = wine_train)
+hc_fit
+```
+
+```{r}
+# Cluster assignments
+extract_cluster_assignment(hc_fit) %>% 
+  table()
+```
+
+**Plot the dendrogram**
+```{r}
+hc_model <- extract_fit_parsnip(hc_fit)$fit
+
+library(dendextend)
+fviz_dend(hc_model, k = 3, horiz = TRUE,
+          rect = TRUE, rect_fill = TRUE, rect_border = "jco", 
+          k_colors = "jco", cex = 0.1)
+
+```
+
+### **Principal Component Analysis**
+- Step 2: Addition of Principal Component Analysis (pca) step to the Kmeans model to see if it improves performance
+- PCA - is a dimensionality reduction technique used to transform the original high-dimensional data into a lower-dimensional space while retaining most of the variance (important information) in the data.
+- It can simplify the data structure, highlight underlying patterns, and make it easier to identify distinct clusters.
+
+**Basic Recipe**
+```{r}
+basic_rec <- recipe(~., data = wine_train) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+
+wine_processed <- prep(basic_rec) %>% bake(new_data = wine_test)
+wine_processed
+```
+
+```{r}
+# Function that helps in implementing PCA
+library(ggforce)
+plot_test2 <- function(recipe, dat = wine_test){
+  recipe %>% 
+    prep() %>% 
+    bake(new_data = dat) %>% 
+    ggplot() +
+    geom_autopoint(aes(color = "steelblue"), alpha = 0.5, size = 1) +
+    geom_autodensity(alpha = 0.3) +
+    facet_matrix(rows = vars(PC1, PC2, PC3,PC4), layer.diag = 2)   # paste0("PC",1:4)
+}
+```
+
+
+```{r}
+# PCA
+basic_rec %>% 
+  step_pca(all_numeric_predictors(), num_comp = 4) %>% 
+  plot_test2() +
+  theme_bw()
+```
+
+PC1 and PC2 captures small clusters in the data, this indicates that the data points in the dataset might share some similarities  
+
+```{r}
+# What features are driving performance?
+
+basic_rec %>% 
+  step_pca(all_numeric_predictors(), num_comp = 4) %>% 
+  prep() %>% 
+  tidy(number = 3) %>% 
+  filter(component %in% paste0("PC",1:4)) %>% 
+  group_by(component) %>% 
+  slice_max(abs(value), n = 5) %>% 
+  ungroup() %>% 
+  ggplot(aes(abs(value), terms, fill = value > 0)) +
+  geom_col(position = "dodge", alpha = 0.7) +
+  facet_wrap(~component, scales = "free_y") +
+  labs(x = "Contribution to Principal Component", y = NULL, fill = "Positive?") +
+  theme_bw()
+```
+
+```{r}
+# Fit the model, including step_pca
+pca_rec <- basic_rec %>% 
+  step_pca(all_numeric_predictors(), num_comp = 4)
+```
+
+
+```{r}
+# Workflow
+kmeans_wf_pca <- workflow() %>% 
+  add_recipe(pca_rec) %>% 
+  add_model(kmeans_spec)
+```
+
+```{r}
+# Tuning
+set.seed(3456)
+wine_res_pca <- tune_cluster(
+  kmeans_wf_pca,
+  resamples = wine_folds,
+  grid = grid,
+  metrics = cluster_metric_set(silhouette_avg))
+
+wine_res_pca
+
+wine_res_pca %>% 
+  collect_metrics()
+```
+
+```{r}
+# Visualizing the results
+wine_res_pca %>% 
+  collect_metrics() %>% 
+  select(num_clusters, mean) %>% 
+  ggplot(aes(x = num_clusters, y = mean)) +
+  geom_point() +
+  geom_line() +
+  theme_minimal() +
+  ylab("mean silhoutte score") +
+  xlab("Number of clusters") +
+  scale_x_continuous(breaks = 1:10)
+```
+
+After adding a PCA step to the k-means model, the silhouette average score improved to 0.40, with 3 still being the optimal number of clusters.
+
+```{r}
+wines_final_wf_pca <- finalize_workflow_tidyclust(kmeans_wf_pca, best_cluster)
+wines_final_wf_pca
+
+# Fit the model
+wines_fit_pca <- fit(wines_final_wf_pca, data = wine_train)
+wines_fit_pca
+```
+
+```{r}
+# Visualize the clusters
+kmeans_model_pca <- extract_fit_parsnip(wines_fit_pca)$fit
+
+fviz_cluster(kmeans_model_pca, data = prep(pca_rec) %>% bake(new_data = NULL),
+             geom = "point",
+             ellipse.type = "circle",
+             palette = "jco",
+             ggtheme = theme_minimal())
+```
+
+
+
+
+
+

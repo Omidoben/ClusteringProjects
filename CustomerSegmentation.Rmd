@@ -1,0 +1,1218 @@
+---
+title: "Customer Segmentation"
+author: "Benard Omido"
+date: "2024-09-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+###### This project involves the analysis of an online retail store data set obtained from the UCI Machine Learning Repository. The data set contains transactional data for two years; 2010 and 2011. Main objective of this project is to boost sales through customer segmentation, using the K-means clustering algorithm.
+
+
+```{r}
+library(tidyverse)
+```
+
+Load the data
+
+```{r}
+ecommerce <- read_csv("Ecommerce.csv")
+glimpse(ecommerce)
+```
+
+**Data set Overview**
+
+- The data contains 8 columns and 541,909 rows.
+- **InvoiceNo:** This is an object data type column that contains the invoice number for each transaction. Each invoice number can represent multiple items purchased in a single transaction.
+- **StockCode:** An object data type column representing the product code for each item.
+- **Description:** This column, also an object data type, contains descriptions of the products
+- **Quantity:* This is an integer column indicating the quantity of products purchased in each transaction
+- **InvoiceDate:** A datetime column that records the date and time of each transaction
+- **UnitPrice:** A float column representing the unit price of each product.
+- **CustomerID:** A float column that contains the customer ID for each transaction.
+- **Country:** An object column recording the country where each transaction took place.
+
+
+**Data Exploration**
+```{r}
+# Missing values and Duplicates
+
+colSums(is.na(ecommerce))     # The description column contains 1454 missing values where as the customer ID column contains 135080 missing values
+
+
+ecommerce %>% 
+  group_by(InvoiceNo, StockCode, Description, CustomerID, InvoiceDate, 
+           Country, UnitPrice, Quantity) %>% 
+  summarize(n = n()) %>% 
+  filter(n > 1)             # There 4,879 duplicates in the data
+
+
+skimr::skim(ecommerce)
+
+# There are 25,900 unique invoices, which represents 25,900 different transactions
+# There are 4070 unique stock codes, this represents the number of unique products sold
+# The description column is 99.73% complete, contains missing value, as we had seen above
+# There are 23260 unique invoice dates
+# Products had been sold in 38 different countries
+# The average quantity of products in a transaction was 9.5. Notably, the quantity column has a minimum of -80995 which indicates the presence of cancelled or returned values, where as the maximum number of products in a single transaction was 80995. The huge gap between the upper quartile and the maximum indicates the presence of outliers.
+# The average unit price in a transaction was 4.61, with a minimum of -11062.06. This may represent the cancelled orders. The maximum unit price was 38970, which indicates the presence of outliers due to the large difference between it and the upper quartile
+# The customer ID column had a completion rate of 75.07%
+
+```
+
+**Data Cleaning and Transformation**
+
+```{r}
+# Handling Missing values
+# The rows with missing values in the customer ID and description columns are removed. This is because imputing missing customer ID values, which will be an important variable in the clustering algorithm, might introduce bias
+
+ecommerce <- ecommerce %>% 
+  na.omit()
+
+ecommerce
+```
+
+
+```{r}
+# Handling Duplicates
+# The completely identical rows in the data might introduce noise in the data, which might hinder the accuracy of the clustering algorithm
+
+#ecommerce_df <- ecommerce %>%
+#  group_by(InvoiceNo, StockCode, Description, CustomerID, InvoiceDate, 
+#           Country, UnitPrice, Quantity) %>%
+#  summarize(n = n()) %>%
+#  mutate(rnk = row_number(n)) %>% 
+#  filter(rnk == 1) %>%
+#  ungroup() %>% 
+#  dplyr::select(-c(n, rnk))
+
+ecommerce <-  ecommerce %>% 
+  group_by(InvoiceNo, StockCode, Description, CustomerID, InvoiceDate, 
+           Country, UnitPrice, Quantity) %>% 
+  distinct() %>% ungroup()
+
+ecommerce
+```
+
+
+```{r}
+# Handling Cancelled orders
+# In order to get a better understanding of customer behavior and preferences, we need to take into account transactions that were cancelled
+# Cancelled transactions have invoices starting with C
+
+canceled_transactions <- str_subset(ecommerce$InvoiceNo, "^C")
+
+ecommerce %>% 
+  filter(InvoiceNo %in% canceled_transactions) %>% 
+  summary()
+
+# All quantities in the cancelled transactions are negative, indicating that indeed these are cancelled transactions
+
+```
+
+
+```{r}
+# Creating stock code anomalies
+# Plotting the top 10 unique most common stock codes
+
+#unique(ecommerce$StockCode)
+n_distinct(ecommerce$StockCode)  # The number of unique stock codes is 3684
+
+ecommerce %>% 
+  group_by(StockCode) %>% 
+  summarize(n = n()) %>% 
+  mutate(prop = n / sum(n)) %>% 
+  slice_max(prop, n = 10) %>% 
+  ggplot(aes(prop, fct_reorder(StockCode, prop), fill = "midnightblue")) +
+  geom_col(show.legend = FALSE) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  labs(x = "Frequency (%)",
+       y = "Stock Codes")
+
+```
+
+Most stock codes are composed of 5 or 6 characters, though there are some anomalies, e.g 'POST'
+
+```{r}
+# Investigating the stock codes with anomalies
+# These anomalies might represent services or non-product transactions (perhaps postage fees) rather than actual products. To maintain the focus of the project, which is clustering based on product purchases and creating a recommendation system, these anomalies should be removed to ensure focus remains strictly on genuine product transactions, which would lead to a more accurate and meaningful analysis.
+
+distinct_codes <- unique(ecommerce$StockCode)
+
+num_chars <- nchar(distinct_codes)
+
+# tibble
+stock_codes_char_counts <- tibble(
+  distinct_codes = distinct_codes,
+  num_chars = num_chars
+)
+
+stock_codes_char_counts %>% count(num_chars, sort = TRUE)
+
+```
+
+2798 codes have 5 characters, 877 have 6 characters, 3 have 4 characters, while others have 1, 2, 3, 7, and 12 characters
+
+```{r}
+# codes that contain zero and 1 numeric characters
+
+# Function to count numeric characters in a string
+count_digits <- function(x) {
+  sum(str_count(x, "\\d"))
+}
+
+count_digits("2356H")
+
+
+# Filter StockCodes that have either zero or one numeric character
+non_numeric_codes <- distinct_codes[sapply(distinct_codes, count_digits) <= 1]
+
+non_numeric_codes
+
+# Removing these anomalous codes
+ecommerce <- ecommerce %>% 
+  filter(!StockCode %in% non_numeric_codes)
+
+ecommerce
+
+```
+
+
+```{r}
+# Cleaning the description column
+
+ecommerce %>% 
+  group_by(Description) %>% 
+  summarize(n = n()) %>% 
+  mutate(prop = n / sum(n)) %>% 
+  slice_max(prop, n = 30) %>% 
+  ggplot(aes(prop, fct_reorder(Description,prop), fill = "steelblue")) +
+  geom_col(show.legend = FALSE) +
+  scale_x_continuous(labels = scales::percent_format())
+```
+
+```{r}
+descriptions_unique <- unique(ecommerce$Description)
+
+ecommerce %>% 
+  filter(str_detect(Description, "[a-z]")) %>% 
+  group_by(Description) %>% summarise(n = n())
+
+# The description column contains some non product descriptions, e.g High resolution Image
+
+# Removing these descriptions
+servixe_related_descriptions <- c("High Resolution Image", "Next Day Carriage")
+
+
+ecommerce <- ecommerce %>% 
+  filter(!Description %in% servixe_related_descriptions)
+
+```
+
+
+```{r}
+# Cleaning the unit price column
+
+summary(ecommerce$UnitPrice)  # The minimum unit price is zero, which indicates some data errors in transactions
+
+# Removing them
+ecommerce <- ecommerce %>% 
+  filter(UnitPrice != 0)
+
+ecommerce
+```
+
+**Feature Engineering**
+
+- To create a comprehensive customer centric data set for clustering and recommendation, the following features were calculated from the data:
+
+**RFM Features**
+- RFM is a method for analyzing customer value and segmenting the customer base.
+
+-**Recency (R)** - This metric indicates how recently a customer has made a purchase. A lower recency value means the customer has purchased more recently, indicating higher engagement with the brand
+
+- **Frequency (F)** - This metric signifies how often a customer makes a purchase within a certain period. A higher frequency value indicates a customer who interacts with the business more often, suggesting higher loyalty or satisfaction
+
+- **Monetary (M)**- This metrics represents the total amount of money a customer has spent over a certain period of time. Customers who have a higher monetary value have contributed more to the business, indicating their potential high life time value
+
+- These metrics help in understanding a customer's buying preferences and behavior, which is important in personalizing marketing strategies and creating a recommendation system
+
+
+**Recency**
+
+- In this step, we focus on understanding how recently a customer has made a purchase. 
+- By understanding the recency of purchases, businesses can tailor their marketing strategies to re-engage customers who have not made purchases in a while, potentially increasing customer retention and fostering loyalty.
+
+```{r}
+# convert Invoice date column to date time type
+class(ecommerce$InvoiceDate)
+head(ecommerce$InvoiceDate)
+ 
+ecommerce <- ecommerce %>% 
+  mutate(InvoiceDate = parse_date_time(InvoiceDate, orders = "mdy_HM"))
+
+# Find the most recent purchase data for each customer
+
+customer_data <- ecommerce %>% 
+  group_by(CustomerID) %>% 
+  summarize(most_recent_purchase_date = max(date(InvoiceDate)))
+
+customer_data
+
+# Find the most recent date in entire data
+most_recent_date <- max(ecommerce$InvoiceDate)
+most_recent_date
+
+# calculate the number of days since the last purchase for each customer
+customer_data <- customer_data %>% 
+  mutate(Days_since_last_purchase = as.Date(most_recent_date) - most_recent_purchase_date,
+         Days_since_last_purchase = str_remove(Days_since_last_purchase, "days")) %>% 
+  dplyr::select(-most_recent_purchase_date)
+  
+customer_data
+```
+
+**Frequency**
+
+- This step involves calculation of two features that quantify the frequency of a customer's engagement with the retailer
+- Total transactions - this represents the total number of transactions made by a customer
+- Total products purchased - This represents the total number of products purchased by a customer across all transactions. It gives insights into into the customer's buying behavior in terms of the volumes of products purchased
+
+```{r}
+# calculate total number of transactions made by each customer
+
+total_transactions <- ecommerce %>% 
+  group_by(CustomerID) %>% 
+  summarize(total_transactions = n_distinct(InvoiceNo))
+
+# calculate total number of products purchased by each customer
+total_products <- ecommerce %>% 
+  group_by(CustomerID) %>% 
+  summarize(total_products = sum(Quantity))
+
+# Merge with the customer_data data set
+customer_data <- customer_data %>% 
+  bind_cols(total_transactions) %>% 
+  bind_cols(total_products) %>% 
+  mutate(CustomerID = CustomerID...1) %>% 
+  dplyr::select(-c(CustomerID...1, CustomerID...3, CustomerID...5)) %>% 
+  dplyr::select(CustomerID, everything())
+
+customer_data
+  
+```
+
+**Monetary**
+
+- This step involves calculation of two features:
+
+- Total Spend - Represents the total amount of money spent by each customer. This feature is important as it helps in identifying the total revenue generated by each customer, which is a direct indicator of a customer's value to the business
+
+- Average Transaction Value - It indicates the average value of a transaction carried out by a customer. This metric is useful in understanding the spending behavior of customers per transaction, which can assist in tailoring marketing strategies and offers to different customer segments based on their average spending patterns.
+
+
+```{r}
+# calculate total amount spent by each customer
+total_spend <- ecommerce %>% 
+  group_by(CustomerID) %>% 
+  summarize(total_spend = sum(Quantity * UnitPrice))
+
+# average amount per transaction
+customer_data <- customer_data %>% 
+  inner_join(total_spend, by = "CustomerID") %>% 
+  mutate(average_transaction_value = total_spend / total_transactions)
+
+customer_data
+```
+
+**Product Diversity**
+
+- This step helps us understand the diversity in product purchase behavior of customers
+
+- Unique products purchased - this feature represents the number of distinct products bought by a customer. A higher value indicates that the customer has a diverse taste or preference, buying a wide range of products, while a lower value might indicate a focused or specific preference. Understanding the diversity in product purchases can help in segmenting customers based on their buying diversity, which can be a critical input in personalizing product recommendations
+
+```{r}
+unique_products_purchased <- ecommerce %>% 
+  group_by(CustomerID) %>% 
+  summarize(unique_products = n_distinct(StockCode))
+
+# Merge with customer_data
+customer_data <- customer_data %>% 
+  inner_join(unique_products_purchased, by = "CustomerID")
+customer_data
+```
+
+**Behavioral Features**
+
+- In this step, we aim to understand and capture the shopping patterns and behaviors of customers. These features will give us insights into the customers' preferences regarding when they like to shop, which can be crucial information for personalizing their shopping experience.
+
+- Average days between purchases - This feature represents the average number of days a customer waits before making another purchase. Understanding this can help in predicting when the customer is likely to make their next purchase, which can be a crucial metric for targeted marketing and personalized promotions.
+
+- Favorite shopping day - This denotes the day of the week when the customer shops the most. This information can help in identifying the preferred shopping days of different customer segments, which can be used to optimize marketing strategies and promotions for different days of the week.
+
+- Favorite Shopping Hour: This refers to the hour of the day when the customer shops the most. Identifying the favorite shopping hour can aid in optimizing the timing of marketing campaigns and promotions to align with the times when different customer segments are most active
+
+- By including these behavioral features in our dataset, we can create a more rounded view of our customers, which will potentially enhance the effectiveness of the clustering algorithm, leading to more meaningful customer segments.
+
+```{r}
+# Extract day and hour from Invoice data column
+day_hour <- ecommerce %>% 
+  mutate(day = wday(InvoiceDate),
+         Hour = hour(InvoiceDate))
+
+# Number of days between consecutive purchases
+days_btwn_purchases <- ecommerce %>% 
+  group_by(CustomerID) %>% 
+  mutate(Days_between_purchases = as.numeric(difftime(date(InvoiceDate), 
+                                                      lag(date(InvoiceDate)), units = "days"))) %>% ungroup()
+
+average_days_btwn_purchases <- days_btwn_purchases %>% 
+  group_by(CustomerID) %>% 
+  summarize(avg_days_btwn_purchases = mean(Days_between_purchases, na.rm = TRUE))
+
+average_days_btwn_purchases
+
+# Favorite shopping day
+favorite_shopping_day <- day_hour %>% 
+  group_by(CustomerID, day) %>% 
+  summarize(count = n()) %>% 
+  ungroup() %>% 
+  group_by(CustomerID) %>% 
+  filter(count == max(count)) %>%
+  arrange(CustomerID, day) %>% 
+  slice(1) %>% 
+  dplyr::select(CustomerID, day)
+
+favorite_shopping_day
+
+# Favorite shopping hour of the day
+
+favorite_shopping_hour <- day_hour %>% 
+  group_by(CustomerID, Hour) %>% 
+  summarize(count = n()) %>% 
+  ungroup() %>% 
+  group_by(CustomerID) %>% 
+  filter(count == max(count)) %>% 
+  arrange(CustomerID, Hour) %>% 
+  slice(1) %>% 
+  dplyr::select(CustomerID, Hour)
+
+favorite_shopping_hour
+
+# Merge with customers data
+customer_data <- customer_data %>% 
+  inner_join(average_days_btwn_purchases, by = "CustomerID") %>% 
+  inner_join(favorite_shopping_day, by = "CustomerID") %>% 
+  inner_join(favorite_shopping_hour, by = "CustomerID")
+
+# Fill NA values in avg_days_btwn_purchases column with 0
+customer_data <- customer_data %>% 
+  mutate(avg_days_btwn_purchases = if_else(is.na(avg_days_btwn_purchases), 0, avg_days_btwn_purchases))
+
+
+colSums(is.na(customer_data))
+customer_data
+```
+
+**Geographic Features**
+
+- We introduce a geographic feature that reflects the geographical location of the customer
+
+- Country - Including the country data can help us understand region-specific buying patterns and preferences. Different regions might have varying preferences and purchasing behaviors which can be critical in personalizing marketing strategies and inventory planning. Furthermore, it can be instrumental in logistics and supply chain optimization, particularly for an online retailer where shipping and delivery play a significant role.
+
+```{r}
+ecommerce %>% 
+  count(Country, sort = TRUE) %>% 
+  mutate(percetage = round(n / sum(n), 2))
+
+# 89% of the transactions are of the United Kingdom
+# Since majority of the transactions are of the UK, we can create a binary feature that is represented by 1 if the transcation is of UK
+
+country_of_transaction <- ecommerce %>% 
+  group_by(CustomerID, Country) %>% 
+  summarize(number_of_transactions = n()) %>%   # number of transactions per customer per country
+  ungroup() %>% 
+  group_by(CustomerID) %>% 
+  filter(number_of_transactions == max(number_of_transactions)) %>%   # extract maximum number of transactions made by a customer
+  mutate(Is_UK = if_else(Country == "United Kingdom", 1, 0)) %>% 
+  dplyr::select(CustomerID, Is_UK)
+
+country_of_transaction %>% 
+  group_by(Is_UK) %>% summarize(n = n())
+
+# Merge with customer data
+customer_data <- customer_data %>% 
+  inner_join(country_of_transaction, by = "CustomerID")
+
+customer_data
+```
+
+**Cancellation Insights**
+
+- Cancellation Frequency - This metric represents the total number of transactions a customer has canceled. Understanding the frequency of cancellations can help us identify customers who are more likely to cancel transactions. This could be an indicator of dissatisfaction or other issues, and understanding this can help us tailor strategies to reduce cancellations and enhance customer satisfaction.
+
+- Cancellation Rate: This represents the proportion of transactions that a customer has canceled out of all their transactions. This metric gives a normalized view of cancellation behavior. A high cancellation rate might be indicative of an unsatisfied customer segment. By identifying these segments, we can develop targeted strategies to improve their shopping experience and potentially reduce the cancellation rate.
+
+```{r}
+# Total number of transactions made by each customer
+total_transactions <- ecommerce %>% 
+  group_by(CustomerID) %>% 
+  summarize(num_transactions = n_distinct(InvoiceNo))
+
+
+# Total number of cancelled transactions for each customer
+ecommerce <- ecommerce %>% 
+  mutate(Transaction_status = if_else(str_detect(InvoiceNo, "^C"), "Cancelled", "Completed"))
+
+cancelled_transactions <- ecommerce %>% 
+  count(CustomerID, Transaction_status) %>% 
+  group_by(CustomerID) %>% 
+  filter(Transaction_status == "Cancelled") %>% 
+  ungroup()
+
+head(cancelled_transactions)  
+
+
+# Merge with customers data 
+customer_data <- customer_data %>% 
+  left_join(cancelled_transactions, by = "CustomerID") %>% 
+  dplyr::select(-Transaction_status) %>% 
+  rename(Cancellation_frequency = n) %>% 
+  mutate(Cancellation_frequency = if_else(is.na(Cancellation_frequency), 0,    Cancellation_frequency))
+
+# Calculate cancellation rate
+customer_data <- customer_data %>% 
+  mutate(Cancellation_rate = Cancellation_frequency / total_transactions)
+
+customer_data
+```
+
+**Seasonality & Trends**
+
+- This step delves into the seasonality and trends in customers' purchasing behaviors, which can offer invaluable insights for tailoring marketing strategies and enhancing customer satisfaction.
+
+- Monthly_Spending_Mean: This is the average amount a customer spends monthly. It helps us gauge the general spending habit of each customer. A higher mean indicates a customer who spends more, potentially showing interest in premium products, whereas a lower mean might indicate a more budget-conscious customer.
+
+- Monthly_Spending_Std: This feature indicates the variability in a customer's monthly spending. A higher value signals that the customer's spending fluctuates significantly month-to-month, perhaps indicating sporadic large purchases. In contrast, a lower value suggests more stable, consistent spending habits. Understanding this variability can help in crafting personalized promotions or discounts during periods they are expected to spend more.
+
+- Spending_Trend: This reflects the trend in a customer's spending over time, calculated as the slope of the linear trend line fitted to their spending data. A positive value indicates an increasing trend in spending, possibly pointing to growing loyalty or satisfaction. Conversely, a negative trend might signal decreasing interest or satisfaction, highlighting a need for re-engagement strategies. A near-zero value signifies stable spending habits. Recognizing these trends can help in developing strategies to either maintain or alter customer spending patterns, enhancing the effectiveness of marketing campaigns.
+
+By incorporating these detailed insights into our customer segmentation model, we can create more precise and actionable customer groups, facilitating the development of highly targeted marketing strategies and promotions.
+
+
+```{r}
+# Extract month and year
+month_year <- ecommerce %>% 
+  mutate(month = month(InvoiceDate),
+         year = year(InvoiceDate))
+
+# Monthly spending for each customer
+monthly_spending <- month_year %>% 
+  group_by(CustomerID, year, month) %>% 
+  summarize(monthly_spending = sum(UnitPrice * Quantity)) %>% 
+  ungroup()
+
+monthly_spending
+
+
+# Seasonal buying patterns
+seasonal_buying_patterns <- monthly_spending %>% 
+  group_by(CustomerID) %>% 
+  summarize(monthly_spending_mean = mean(monthly_spending, na.rm = TRUE),
+            monthly_spending_std = sd(monthly_spending, na.rm = TRUE)) %>% 
+  ungroup()
+
+seasonal_buying_patterns
+
+
+#Replace NA values in monthly_spending_std column
+seasonal_buying_patterns <- seasonal_buying_patterns %>%
+  mutate(monthly_spending_std = if_else(is.na(monthly_spending_std), 0, monthly_spending_std))
+
+
+# Calculating spend trends
+
+calculate_trend <- function(spend_data){
+  if(length(spend_data) > 1){
+    x <- seq_along(spend_data)   #Generate sequence for time points
+    model <- lm(spend_data~x)    #Fit linear model
+    return(coef(model)[["x"]])   #Return the slope (trend)
+  }
+  else{
+    return(0)
+  }
+}
+
+# Apply the above function to each customer's spending data
+spending_trends <- monthly_spending %>% 
+  group_by(CustomerID) %>% 
+  summarize(spending_trend = calculate_trend(monthly_spending)) %>% 
+  ungroup()
+
+spending_trends  
+
+
+# Explaining the above function
+
+# The calculate_trend() function is designed to calculate the trend (slope) of a customer's spending over time. The slope is a measure of how a customer's spending changes from one time period (e.g., month) to the next.
+
+# spend_data is the input to the function. It represents a vector of spending values for a customer over different time periods (e.g., monthly spending amounts).
+
+# The function first checks if there is more than one data point in spend_data.
+#If there is only one data point (e.g., spending data for just one month), a trend cannot be calculated. So, the function will return 0 for such cases.
+
+# seq_along(spend_data) - generates a sequence of integers from 1 to the length of spend_data.
+# This sequence represents the time periods for the spending data (e.g., the 1st month, 2nd month, etc.).
+
+# lm(spend_data ~ x) - fits a simple linear regression model, where spend_data is the dependent variable (y-axis) and x is the independent variable (x-axis).
+# This model essentially tries to fit a straight line through the data points, with the goal of finding the best-fitting line that explains how spending changes over time.
+
+# coef(model)[["x"]] extracts the slope of the fitted line from the linear model.
+# A positive slope means spending is increasing over time.
+# A negative slope means spending is decreasing over time.
+# A slope of zero indicates that spending is stable, with no upward or downward trend.
+
+
+
+# Merge with the customers data
+customer_data <- customer_data %>% 
+  inner_join(seasonal_buying_patterns, by = "CustomerID") %>% 
+  inner_join(spending_trends, by = "CustomerID")
+
+customer_data
+```
+
+```{r}
+# Change data type for customer id and Days since last purchase
+
+customer_data <- customer_data %>% 
+  mutate(CustomerID = as.character(CustomerID),
+         Days_since_last_purchase = as.numeric(Days_since_last_purchase))
+
+customer_data
+```
+
+
+##### **Customer Dataset Description:**
+
+**Variable	Description**
+
+**CustomerID** - Identifier uniquely assigned to each customer, used to distinguish individual customers.
+
+**Days_Since_Last_Purchase** - The number of days that have passed since the customer's last purchase.
+
+**Total_Transactions** - The total number of transactions made by the customer.
+
+**Total_Products_Purchased** - The total quantity of products purchased by the customer across all transactions.
+
+**Total_Spend** -	The total amount of money the customer has spent across all transactions.
+
+**Average_Transaction_Value** -	The average value of the customer's transactions, calculated as total spend divided by the number of transactions.
+
+**Unique_Products_Purchased** -	The number of different products the customer has purchased.
+
+**Average_Days_Between_Purchases** -	The average number of days between consecutive purchases made by the customer.
+
+**Day_Of_Week** -	The day of the week when the customer prefers to shop, represented numerically 
+
+**Hour** -	The hour of the day when the customer prefers to shop, represented in a 24-hour format.
+
+**Is_UK** -	A binary variable indicating whether the customer is based in the UK (1) or not (0).
+
+**Cancellation_Frequency** -	The total number of transactions that the customer has cancelled.
+
+**Cancellation_Rate** -	The proportion of transactions that the customer has cancelled, calculated as cancellation frequency divided by total transactions.
+
+**Monthly_Spending_Mean** -	The average monthly spending of the customer.
+
+**Monthly_Spending_Std** -	The standard deviation of the customer's monthly spending, indicating the variability in their spending pattern.
+
+**Spending_Trend** -	A numerical representation of the trend in the customer's spending over time. A positive value indicates an increasing trend, a negative value indicates a decreasing trend, and a value close to zero indicates a stable trend.
+
+
+**Outlier detection and prevention**
+
+- Outliers are data points that are significantly different from the majority of other points in the dataset. 
+
+- These points can potentially skew the results of our analysis, especially in k-means clustering where they can significantly influence the position of the cluster centroids.
+
+- Given the multi-dimensional nature of the data, it would be prudent to use algorithms that can detect outliers in multi-dimensional spaces. 
+
+- We use the Isolation Forest algorithm for this task. 
+
+- This algorithm works well for multi-dimensional data and is computationally efficient. It isolates observations by randomly selecting a feature and then randomly selecting a split value between the maximum and minimum values of the selected feature.
+
+
+```{r}
+
+# First approach using the isolation forest model
+
+#library(isotree)
+
+#model <- isolation.forest(customer_data[, -1], ntrees = 100, sample_size = 256, nthreads = 1, seed = 123, prob_pick_pooled_gain = 0.05)
+
+# Predict outliers
+
+#customer_data$Outlier_Scores <- predict(model, customer_data[, -1])
+
+# Create a new column to identify outliers (1 for inliers and 0 for outliers)
+
+#customer_data$Is_Outlier <- ifelse(customer_data$Outlier_Scores == 1, 0, 1)
+
+#customer_data
+
+
+
+# Using Mahalanobis Distance to Detect Outliers
+
+library(MASS)
+
+
+# Extract numeric features (assuming CustomerID is in the first column)
+numeric_data <- customer_data[, -1]
+
+
+# Compute the covariance matrix and mean of the numeric data
+cov_matrix <- cov(numeric_data)
+mean_vector <- colMeans(numeric_data)
+
+# Compute the Mahalanobis distance for each row in the dataset
+customer_data$Mahalanobis_Dist <- mahalanobis(numeric_data, center = mean_vector, cov = cov_matrix)
+
+customer_data
+
+# Define the threshold for identifying outliers
+# Use chi-squared distribution to set a threshold (e.g., p-value = 0.975 for 95% confidence)
+# df = number of columns used in Mahalanobis distance (dimensionality of the data)
+threshold <- qchisq(0.975, df = ncol(numeric_data))
+threshold
+# Label observations as outliers based on the Mahalanobis distance
+customer_data <- customer_data %>%
+  mutate(Is_Outlier = ifelse(Mahalanobis_Dist > threshold, 1, 0))
+
+customer_data %>% 
+  count(Is_Outlier)
+
+customer_data %>% 
+  filter(Is_Outlier == 1)
+
+```
+
+**Isolation Forest**
+
+- An Isolation Forest is a machine learning model designed specifically for anomaly detection, which works by isolating observations in a dataset. The basic idea is that anomalies are few and different, so they are more susceptible to isolation.
+
+- ntrees - This parameter specifies the number of trees to grow in the isolation forest. A higher number of trees can improve the model's accuracy but also increases computation time
+
+- sample_size - This parameter determines the number of samples (data points) to be used for each tree in the forest. A smaller sample size can make the trees less accurate but faster to compute. The default value often used is 256, which is a good balance between computational efficiency and model accuracy.
+
+- nthreads - This parameter specifies the number of threads to use for parallel processing. If you set this to a value higher than 1, the model can take advantage of multiple CPU cores to speed up computation. Setting nthreads = 1 means the model will run on a single core.
+
+- prob_pick_pooled_gain - This parameter controls the "contamination" level or the expected proportion of outliers in the dataset. A lower value (like 0.05) suggests that the model should assume that around 5% of the data points are outliers. This setting influences how aggressively the model identifies outliers.
+
+
+**Mahalanobis Distance (Multivariate Outliers)**
+
+- For multivariate data, Mahalanobis distance helps detect outliers by measuring the distance between a point and the distribution of all other points.
+
+
+```{r}
+# Removing outliers if present
+
+# Separate the outliers for analysis
+outliers_data <- customer_data[customer_data$Is_Outlier == 1, ]
+
+# Remove the outliers from the main dataset
+customer_data_cleaned <- customer_data[customer_data$Is_Outlier == 0, ]
+
+# Drop the Mahalanobis_Dist and 'Is_Outlier' columns
+customer_data_cleaned <- customer_data_cleaned %>% 
+    dplyr::select(-c(Mahalanobis_Dist, Is_Outlier))
+
+customer_data_cleaned
+```
+
+**Correlation Analysis**
+
+- The presence of multicollinearity, where features are highly correlated, can potentially affect the clustering process by not allowing the model to learn the actual underlying patterns in the data, as the features do not provide unique information. This could lead to clusters that are not well-separated and meaningful.
+
+- If we identify multicollinearity, we can utilize dimensionality reduction techniques like PCA. These techniques help in neutralizing the effect of multicollinearity by transforming the correlated features into a new set of uncorrelated variables, preserving most of the original data's variance. This step not only enhances the quality of clusters formed but also makes the clustering process more computationally efficient.
+
+
+```{r}
+library(ggcorrplot)
+customer_data_cleaned %>% 
+  select_if(is.numeric) %>% 
+  cor(use = "complete.obs") %>% 
+  ggcorrplot(method = "square",
+             type = "full", lab = TRUE, lab_size = 2, tl.cex = 10)
+```
+
+There are some highly correlated variables in the data. For example:
+Total spend vs total products purchased
+Total transactions vs Total spend e.t.c
+
+**Handling Multicollinearity through PCA**
+
+**Data Preparation - Feature Scaling**
+
+Before we move forward with the clustering and dimensionality reduction, it's imperative to scale our features. This step holds significant importance, especially in the context of distance-based algorithms like K-means and dimensionality reduction methods like PCA. Here's why:
+
+- For K-means Clustering: K-means relies heavily on the concept of 'distance' between data points to form clusters. When features are not on a similar scale, features with larger values can disproportionately influence the clustering outcome, potentially leading to incorrect groupings.
+
+- For PCA: PCA aims to find the directions where the data varies the most. When features are not scaled, those with larger values might dominate these components, not accurately reflecting the underlying patterns in the data.
+
+**PCA**
+
+```{r}
+# List of columns that don't need to be scaled
+
+columns_to_exclude <- c('CustomerID', 'Is_UK', 'day')
+
+# List of columns that need to be scaled (excluding the ones that don't need scaling)
+columns_to_scale <- setdiff(names(customer_data_cleaned), columns_to_exclude)
+
+# Copy the cleaned dataset
+customer_data_scaled <- customer_data_cleaned
+
+# Apply scaling to the necessary columns in the dataset
+customer_data_scaled[columns_to_scale] <- scale(customer_data_cleaned[columns_to_scale])
+
+head(customer_data_scaled)
+
+
+# Set CustomerID as row names
+row.names(customer_data_scaled) <- customer_data_scaled$CustomerID
+customer_data_scaled <- customer_data_scaled %>% dplyr::select(-CustomerID)
+
+#customer_data_scaled <- customer_data_scaled %>% mutate(Is_UK = as.numeric(Is_UK))
+
+# Apply PCA
+pca_model <- prcomp(customer_data_scaled, scale. = TRUE)
+pca_model
+summary(pca_model)
+
+
+# Extract the standard deviations of the principal components
+std_devs <- pca_model$sdev
+
+# Calculate the variance explained by each component
+explained_variance <- (std_devs^2) / sum(std_devs^2)
+
+# Calculate the cumulative variance
+cumulative_variance <- cumsum(explained_variance)
+
+# Set the number of components
+num_components <- length(explained_variance)
+
+# Create a data frame for plotting
+
+pca_variance_df <- data.frame(
+  Component = 1:num_components,
+  ExplainedVariance = explained_variance,
+  CumulativeVariance = cumulative_variance
+)
+
+
+# Plot the explained variance and cumulative variance
+
+ggplot(pca_variance_df, aes(x = Component)) +
+  geom_bar(aes(y = ExplainedVariance), stat = "identity", fill = "#fcc36d", alpha = 0.8) +
+  geom_line(aes(y = CumulativeVariance), color = "#ff6200", size = 1.5, linetype = "dashed") +
+  geom_point(aes(y = CumulativeVariance), color = "#ff6200", size = 2) +
+  geom_vline(xintercept = 6, linetype = "dashed", color = "red") +  
+  labs(title = "Explained and Cumulative Variance by PCA Components",
+       x = "Principal Components",
+       y = "Variance Explained") +
+  theme_minimal() +
+  theme(panel.grid.major = element_line(color = "#fcf0dc")) +
+   scale_x_continuous(breaks = 1:length(explained_variance)) +
+  # Add annotations for explained variance and cumulative variance values
+  geom_text(aes(y = ExplainedVariance, label = round(ExplainedVariance, 2)), 
+            vjust = -0.5, size = 2.5) +
+  geom_text(aes(y = CumulativeVariance, label = round(CumulativeVariance, 2)), 
+            vjust = 1.5, size = 2.5)
+
+```
+
+- The plot and the cumulative explained variance values indicate how much of the total variance in the dataset is captured by each principal component, as well as the cumulative variance explained by the first n components.
+
+- Variance is a measure of how much the data points differ from the mean. In PCA, it helps us understand how much of the dataset’s structure or information is captured by each principal component.
+
+- Principal Component (PC): Each PC is an axis that is a linear combination of the original features. The first PC captures the maximum variance in the data, and each subsequent PC captures the next highest variance, subject to being orthogonal to the previous components.
+
+- A common rule of thumb is to retain enough components to explain at least 70-90% of the variance, depending on the complexity you want to retain and how much information loss is acceptable.
+
+- Here, we can observe that:
+
+- The first component explains approximately 32% of the variance.
+
+- The first two components together explain about 44% of the variance.
+
+- The first three components explain approximately 53% of the variance, and so on.
+
+- To choose the optimal number of components, we generally look for a point where adding another component doesn't significantly increase the cumulative explained variance, often referred to as the "elbow point" in the curve.
+
+- From the plot, we can see that the increase in cumulative variance starts to slow down after the 6th component (which captures about 75% of the total variance).
+
+- Considering the context of customer segmentation, we want to retain a sufficient amount of information to identify distinct customer groups effectively. Therefore, retaining the first 6 components might be a balanced choice, as they together explain a substantial portion of the total variance while reducing the dimensionality of the dataset.
+
+
+**K-means Clustering**
+
+```{r}
+library(tidymodels)
+library(tidyclust)
+
+# Data Preprocessing
+customer_df <- customer_data_cleaned %>% 
+  mutate(Is_UK = as.factor(Is_UK))
+
+# Recipe
+customers_rec <- recipe(~., data = customer_df) %>% 
+  step_rm(CustomerID) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  step_zv(all_numeric_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_pca(all_numeric_predictors(), num_comp = 4)
+
+customers_rec
+```
+
+
+```{r}
+# Model specification
+kmeans_spec <- k_means(num_clusters = tune()) %>% 
+  set_engine("stats")
+
+kmeans_spec
+```
+
+```{r}
+# Workflow
+customers_wf <- workflow() %>% 
+  add_model(kmeans_spec) %>% 
+  add_recipe(customers_rec)
+
+customers_wf
+```
+
+```{r}
+# Tuning
+# Cross validation folds
+set.seed(6132)
+customer_folds <- vfold_cv(customer_df)
+
+# Grid
+set.seed(8712)
+customer_res <- tune_cluster(
+  customers_wf,
+  resamples = customer_folds,
+  grid = 10,
+  metrics = cluster_metric_set(silhouette_avg)
+)
+
+customer_res
+
+```
+
+```{r}
+customer_res %>% 
+  collect_metrics()
+```
+
+- 
+```{r}
+# Plot the tuning results
+
+customer_res %>% 
+  collect_metrics() %>% 
+  dplyr::select(num_clusters, mean) %>% 
+  ggplot(aes(num_clusters, mean)) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1.0) +
+  theme_bw() +
+  ylab("mean silhoutte score") +
+  xlab("Number of clusters") +
+  scale_x_continuous(breaks = 1:10)
+
+```
+
+- The optimal number of clusters for the model is determined to be 3, based on the highest silhouette score of 0.4234. This indicates that the 3-cluster solution provides the best-defined and most distinct grouping of the data compared to other cluster numbers evaluated.
+
+```{r}
+# Using elbow and silhoutte graphs to determine number of clusters
+library(factoextra)
+
+# calculate distance
+customer_dist <- get_dist(customer_data_scaled, method = "euclidean")
+
+# Elbow method
+fviz_nbclust(
+  customer_data_scaled,
+  kmeans,
+  k.max = 10,
+  method = "wss",
+  diss = customer_dist
+)
+
+
+# Silhoutte method
+fviz_nbclust(
+  customer_data_scaled,
+  kmeans,
+  k.max = 10,
+  method = "silhouette",
+  diss = customer_dist
+)
+
+```
+
+- The Elbow method plot indicates that the optimal number of clusters is between 2 and 3, where as the silhouette plot indicates that the optimal number of clusters is 2. 
+- Although the silhouette plot suggests 2 clusters, the cross-validated tuning results provide a more reliable assessment, making 3 clusters the optimal choice.
+
+
+```{r}
+# Select optimal number of clusters and number of components, then finalize the workflow
+best_clusters <- tibble(num_clusters = 3)
+best_clusters
+
+clusters_final_wf <- finalize_workflow_tidyclust(customers_wf, best_clusters)
+clusters_final_wf
+
+# Fit the model
+customers_fit <- fit(clusters_final_wf, data = customer_df)
+customers_fit
+
+```
+
+```{r}
+# To get the clusters
+
+cluster_assignments <- predict(customers_fit, new_data = customer_df)
+cluster_assignments
+
+# Observe the cluster in which each customer falls in
+
+customer_df <- cluster_assignments %>% 
+  bind_cols(customer_df)
+
+customer_df
+```
+
+
+```{r}
+# Inspect the results
+
+extract_cluster_assignment(customers_fit) %>% table()
+
+extract_centroids(customers_fit)
+```
+
+From the fitted model, the first cluster has 3171 observations, the second cluster has 360 observations while the third cluster has 629.
+
+```{r}
+# calculate distance
+dists = dist(prep(customers_rec) %>% bake(new_data = NULL), method = "euclidean")
+
+silhouette_avg(customers_fit, dists = dists)
+
+#silhouette_avg_vec(customers_fit, dists = dists)
+```
+
+- The model results in a silhouette score = 0.6181. This suggests that the clusters are well separated and that most of the points are correctly assigned to their clusters.
+
+- The model is performing reasonably well in differentiating between the clusters, and most data points are closer to their own cluster than to others.
+
+```{r}
+#Visualize the clusters
+
+customer_model <- extract_fit_parsnip(customers_fit)$fit
+
+fviz_cluster(customer_model, data = prep(customers_rec) %>% bake(new_data = NULL),
+             geom = "point",
+             ellipse.type = "circle",
+             palette = "jco",
+             ggtheme = theme_minimal())
+```
+
+- The above plot shows a good separation of the clusters. With a few observations overlapping in cluster 2.
+
+**Building a recommendation system**
+
+```{r}
+outliers_data
+
+# Extract the CustomerIDs of the outliers and remove their transactions from the main dataframe
+
+outlier_customer_ids <- unique(outliers_data$CustomerID)
+
+df_filtered <- ecommerce %>% 
+  filter(!(CustomerID %in% outlier_customer_ids))
+
+df_filtered
+```
+
+```{r}
+# Convert CustomerID to numeric to ensure consistency
+
+customer_df <- customer_df %>%
+  mutate(CustomerID = as.numeric(CustomerID))
+```
+
+
+```{r}
+# Merge the transaction data with the customer data to get the cluster information for each transaction
+
+merged_data <- df_filtered %>%
+  inner_join(customer_df, by = "CustomerID") 
+
+merged_data <- merged_data %>% 
+  rename(cluster = .pred_cluster)
+
+merged_data
+```
+
+Identify the top 10 best-selling products in each cluster based on the total quantity sold
+
+```{r}
+# Group by cluster, StockCode, and Description to get total quantity sold
+
+best_selling_products <- merged_data %>%
+  group_by(cluster, StockCode, Description) %>%
+  summarize(total_quantity = sum(Quantity, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(cluster, desc(total_quantity))
+
+# Extract the top 10 products per cluster
+top_products_per_cluster <- best_selling_products %>%
+  group_by(cluster) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+top_products_per_cluster
+
+```
+
+Create a record of products purchased by each customer in each cluster
+
+```{r}
+customer_purchases <- merged_data %>%
+  group_by(CustomerID, cluster, StockCode) %>%
+  summarize(total_quantity = sum(Quantity, na.rm = TRUE)) %>%
+  ungroup()
+
+customer_purchases
+```
+
+Generate recommendations for each customer in each cluster
+
+**First Approach**
+
+```{r}
+# Initialize an empty list to store recommendations
+
+#recommendations <- list()
+
+# Loop through each cluster
+#for (cluster_id in unique(top_products_per_cluster$cluster)) {
+  
+  # Extract top products for the current cluster
+#  top_products <- top_products_per_cluster %>%
+#    filter(cluster == cluster_id)
+  
+  # Get customers belonging to the current cluster
+#  customers_in_cluster <- merged_data %>%
+#    filter(cluster == cluster_id) %>%
+#    pull(CustomerID)
+  
+  # Loop through each customer in the cluster
+#  for (customer in customers_in_cluster) {
+    
+    # Find products already purchased by the customer
+#    customer_purchased_products <- customer_purchases %>%
+#      filter(CustomerID == customer, cluster == cluster_id) %>%
+#      pull(StockCode)
+    
+    # Identify top products the customer hasn't purchased yet
+#    top_products_not_purchased <- top_products %>%
+#      filter(!(StockCode %in% customer_purchased_products)) %>%
+#      slice_head(n = 3)
+    
+    # Create a recommendation list for the customer
+#    recommendation <- c(customer, cluster_id, 
+#                        top_products_not_purchased$StockCode, 
+#                        top_products_not_purchased$Description)
+    
+    # Append the recommendation to the list
+#    recommendations <- append(recommendations, list(recommendation))
+#  }
+#}
+
+#recommendations
+
+```
+
+Create a dataframe from the recommendations list and merge it with the original customer data
+
+
+**Second Approach**
+
+```{r}
+# Generate recommendations for each customer in each cluster
+# First, create a list of all top products for each cluster
+all_top_products <- top_products_per_cluster %>%
+  group_by(cluster) %>%
+  summarize(top_products = list(StockCode), .groups = "drop")
+
+all_top_products
+
+
+# Identify products already purchased by each customer
+customer_purchases_summary <- customer_purchases %>%
+  group_by(CustomerID, cluster) %>%
+  summarize(purchased_products = list(StockCode), .groups = "drop")    # creates a list of product codes (stock codes) each customer has purchased.
+
+customer_purchases_summary
+
+
+
+# Generate recommendations by removing purchased products from the top products for the cluster
+recommendations_df <- customer_purchases_summary %>%
+  left_join(all_top_products, by = "cluster") %>%
+  rowwise() %>%
+  mutate(recommendations = list(setdiff(top_products, purchased_products))) %>%
+  ungroup() %>%
+  mutate(recommendations = map(recommendations, ~ head(.x, 3))) %>%  # Limit to top 3 recommendations
+  dplyr::select(CustomerID, cluster, recommendations) %>%
+  unnest_wider(recommendations, names_sep = "_")
+
+recommendations_df
+
+
+
+# Merge the recommendations with the customer data
+customer_data_with_recommendations <- merged_data %>%
+  left_join(recommendations_df, by = c("CustomerID", "cluster"))
+
+# Output the final recommendations
+customer_data_with_recommendations
+```
+
+- left_join(all_top_products, by = "cluster") merges the top products for each cluster with each customer's purchase history. This ensures that we have both the top products and the customer's purchased products available in the same row for each CustomerID and cluster.
+
+- rowwise() ensures that the subsequent operations happen on a row-by-row basis rather than column-wise.
+
+- mutate(recommendations = list(setdiff(top_products, purchased_products))) generates recommendations by using setdiff(), which identifies products from top_products that the customer hasn't purchased yet. The result is a list of unpurchased top products for each customer.
+
+- mutate(recommendations = map(recommendations, ~ head(.x, 3))) limits the number of recommendations to the top 3 products. map() is used to apply the head() function to each list of recommendations, selecting the first 3 products.
+
+
+
+
+
+
+
